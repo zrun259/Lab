@@ -1,94 +1,121 @@
 #include <Arduino.h>
 #include <AccelStepper.h>
 
-// --- 硬件引脚 (根据你的老师例程修改为 3, 4) ---
+// --- 硬件引脚 ---
 const int pulXPin = 3;
 const int dirXPin = 4;
 
 // --- 物理参数 ---
-const float stepsPerMm = 1600.0; // 根据你的驱动器 Pulse/rev 调整
+const float stepsPerMm = 1600.0;
 
-// --- 扫描任务变量 ---
-float startPosMm = 0.0;    // 扫描起点
-float endPosMm = 50.0;     // 扫描终点
-float stepSizeMm = 1.0;    // 步长
-int totalCycles = 5;       // 往复次数
-int currentCycle = 1;      // 当前第几次往复
-bool isScanning = false;   // 扫描状态控制
-bool movingForward = true; // 运动方向：true往终点，false往起点
+// --- 扫描参数（由上位机通过串口写入）---
+float startPosMm  = 0.0;
+float endPosMm    = 50.0;
+float stepSizeMm  = 1.0;
+int   totalCycles = 1;
 
-AccelStepper slider(1, pulXPin, dirXPin);
+// --- 运行状态 ---
+int  currentCycle  = 1;
+bool movingForward = true;
 
-void setup() {
-    Serial.begin(115200); // 建议使用高波特率，减少串口阻塞
-    
-    slider.setMaxSpeed(2000.0);
-    slider.setAcceleration(1000.0);
-    
-    // 初始位置设为 0 (假设开机前已手动归位)
-    slider.setCurrentPosition(0);
-}
+AccelStepper slider(AccelStepper::DRIVER, pulXPin, dirXPin);
 
-// 执行一步并上报坐标
+// ──────────────────────────────────────────────
+// 移动到目标并等待上位机 'G' 握手
+// ──────────────────────────────────────────────
 void moveAndReport(float targetMm) {
     long targetSteps = (long)(targetMm * stepsPerMm);
     slider.moveTo(targetSteps);
-    while (slider.distanceToGo() != 0) { slider.run(); }
+    while (slider.distanceToGo() != 0) {
+        slider.run();
+    }
 
-    // 1. 到达位置，发送坐标
     Serial.print("X:");
     Serial.print(targetMm, 3);
     Serial.print(",N:");
     Serial.println(currentCycle);
 
-    // 2. 等待上位机发送指令后再继续 (阻塞)
-    // 只有收到 'G' (Go) 字符才会退出此循环
+    // 阻塞等待上位机发送 'G' / 'g' 才继续
     while (true) {
         if (Serial.available() > 0) {
             char c = Serial.read();
-            if (c == 'G' || c == 'g') break; 
+            if (c == 'G' || c == 'g') break;
         }
     }
 }
 
+// ──────────────────────────────────────────────
+// 解析参数命令  P:<start>,<end>,<step>,<cycles>
+// ──────────────────────────────────────────────
+bool parseParams(const String& line) {
+    // 期望格式: P:0.000,50.000,1.000,3
+    if (!line.startsWith("P:")) return false;
+
+    String body = line.substring(2); // 去掉 "P:"
+    int i0 = body.indexOf(',');
+    int i1 = body.indexOf(',', i0 + 1);
+    int i2 = body.indexOf(',', i1 + 1);
+
+    if (i0 < 0 || i1 < 0 || i2 < 0) return false;
+
+    startPosMm  = body.substring(0, i0).toFloat();
+    endPosMm    = body.substring(i0 + 1, i1).toFloat();
+    stepSizeMm  = body.substring(i1 + 1, i2).toFloat();
+    totalCycles = body.substring(i2 + 1).toInt();
+
+    return (stepSizeMm > 0 && endPosMm > startPosMm && totalCycles > 0);
+}
+
+// ──────────────────────────────────────────────
+// 执行扫描
+// ──────────────────────────────────────────────
 void startScan() {
-    isScanning = true;
-    currentCycle = 1;
-    
+    currentCycle  = 1;
+    movingForward = true;
+
     while (currentCycle <= totalCycles) {
         if (movingForward) {
-            // 从起点向终点步进
-            for (float p = startPosMm; p <= endPosMm; p += stepSizeMm) {
+            for (float p = startPosMm; p <= endPosMm + 1e-6f; p += stepSizeMm) {
                 moveAndReport(p);
-                // 在此处上位机接收到串口信号后，会去读取光子计数器
             }
-            movingForward = false; // 调转方向
+            movingForward = false;
         } else {
-            // 从终点向起点步进
-            for (float p = endPosMm; p >= startPosMm; p -= stepSizeMm) {
+            for (float p = endPosMm; p >= startPosMm - 1e-6f; p -= stepSizeMm) {
                 moveAndReport(p);
             }
-            movingForward = true; // 调转方向
-            currentCycle++;       // 完成一次完整往复
+            movingForward = true;
+            currentCycle++;
         }
     }
-    isScanning = false;
+
     Serial.println("SCAN_FINISHED");
+}
+
+// ──────────────────────────────────────────────
+
+void setup() {
+    Serial.begin(115200);
+    slider.setMaxSpeed(2000.0);
+    slider.setAcceleration(1000.0);
+    slider.setCurrentPosition(0);
 }
 
 void loop() {
     if (Serial.available() > 0) {
-        char cmd = Serial.read();
-        
-        // 解析上位机指令
-        // S: 开始扫描
-        // Z: 强制归零
-        if (cmd == 'S' || cmd == 's') {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+
+        if (cmd.startsWith("P:")) {
+            if (parseParams(cmd)) {
+                Serial.println("PARAM_OK");
+            } else {
+                Serial.println("PARAM_ERR");
+            }
+        } else if (cmd == "S" || cmd == "s") {
             startScan();
-        } else if (cmd == 'Z' || cmd == 'z') {
+        } else if (cmd == "Z" || cmd == "z") {
             slider.setCurrentPosition(0);
             Serial.println("ZERO_OK");
         }
-        // 如果需要在线设置参数，可以扩展 Serial.parseFloat 等逻辑
     }
 }
