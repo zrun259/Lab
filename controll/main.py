@@ -1,259 +1,438 @@
-import serial
-import serial.tools.list_ports
+import sys
 import csv
 import time
-import sys
+import serial
+import serial.tools.list_ports
 
-# --- 默认配置 ---
-BAUD_RATE = 115200
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QFormLayout,
+    QLabel, QLineEdit, QComboBox, QPushButton,
+    QCheckBox, QGroupBox, QSplitter,
+    QMessageBox, QFileDialog, QStatusBar,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import (
+    FigureCanvasQTAgg as FigureCanvas,
+    NavigationToolbar2QT as NavigationToolbar,
+)
+from matplotlib.figure import Figure
+
+BAUD_RATE   = 115200
 OUTPUT_FILE = "scan_data.csv"
 
 
-# ──────────────────────────────────────────────
-# 工具函数
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# 扫描工作线程
+# ══════════════════════════════════════════════
 
-def get_float(prompt, default):
-    s = input(f"{prompt} [默认 {default}]: ").strip()
-    if not s:
-        return default
-    try:
-        return float(s)
-    except ValueError:
-        print("输入无效，使用默认值")
-        return default
+class ScanWorker(QThread):
+    data_point = pyqtSignal(int, float, int)   # cycle, pos_mm, photon
+    status_msg = pyqtSignal(str)
+    error_msg  = pyqtSignal(str)
+    finished   = pyqtSignal()
 
+    def __init__(self, port_slider, port_detector,
+                 start_mm, end_mm, step_mm, cycles):
+        super().__init__()
+        self.port_slider   = port_slider
+        self.port_detector = port_detector
+        self.start_mm      = start_mm
+        self.end_mm        = end_mm
+        self.step_mm       = step_mm
+        self.cycles        = cycles
+        self._stop_flag    = False
 
-def get_int(prompt, default):
-    s = input(f"{prompt} [默认 {default}]: ").strip()
-    if not s:
-        return default
-    try:
-        return int(s)
-    except ValueError:
-        print("输入无效，使用默认值")
-        return default
+    def stop(self):
+        self._stop_flag = True
 
+    def _read_photon(self, ser_det):
+        """清空缓冲区，丢弃第一个有效行，返回第二个有效整数。"""
+        ser_det.reset_input_buffer()
+        # 丢弃第一个
+        while not self._stop_flag:
+            raw = ser_det.readline().decode("utf-8", errors="ignore").strip()
+            if raw:
+                break
+        # 读取第二个
+        while not self._stop_flag:
+            raw = ser_det.readline().decode("utf-8", errors="ignore").strip()
+            if not raw:
+                continue
+            try:
+                return int(raw)
+            except ValueError:
+                continue
+        return None
 
-def get_str(prompt, default):
-    s = input(f"{prompt} [默认 {default}]: ").strip()
-    return s if s else default
-
-
-# ──────────────────────────────────────────────
-# 串口扫描与选择
-# ──────────────────────────────────────────────
-
-def scan_ports():
-    """返回当前系统可用串口列表 [(port, description), ...]"""
-    ports = serial.tools.list_ports.comports()
-    return sorted(ports, key=lambda p: p.device)
-
-
-def select_port(role):
-    """交互式选择串口，返回端口名称字符串（如 'COM5'）。"""
-    while True:
-        ports = scan_ports()
-        if not ports:
-            print("  未检测到任何串口，请检查连接后按回车重新扫描...")
-            input()
-            continue
-
-        print(f"\n  可用串口列表（选择{role}）：")
-        for i, p in enumerate(ports):
-            print(f"    [{i}] {p.device:10s}  {p.description}")
-        print(f"    [r] 重新扫描")
-
-        choice = input("  请输入编号: ").strip().lower()
-        if choice == "r":
-            continue
+    def run(self):
+        ser_slider = None
+        ser_det    = None
         try:
-            idx = int(choice)
-            if 0 <= idx < len(ports):
-                return ports[idx].device
-        except ValueError:
-            pass
-        print("  输入无效，请重试")
+            ser_slider = serial.Serial(self.port_slider,   BAUD_RATE, timeout=5)
+            ser_det    = serial.Serial(self.port_detector, BAUD_RATE, timeout=5)
 
+            self.status_msg.emit("等待 Arduino 复位 (2s)...")
+            time.sleep(2)
+            ser_slider.reset_input_buffer()
 
-# ──────────────────────────────────────────────
-# 探测器读数
-# ──────────────────────────────────────────────
+            # 发送扫描参数
+            cmd = (f"P:{self.start_mm:.3f},{self.end_mm:.3f},"
+                   f"{self.step_mm:.3f},{self.cycles}\n")
+            ser_slider.write(cmd.encode("utf-8"))
+            self.status_msg.emit(f"已发送参数: {cmd.strip()}")
 
-def read_photon(ser_det):
-    """
-    清空缓冲区后，丢弃第一个有效数据行，返回第二个有效整数光子计数。
-    探测器输出格式示例（每行一个整数，前后可能有空格）：
-         2
-         1
-         0
-    """
-    ser_det.reset_input_buffer()
+            deadline = time.time() + 5.0
+            param_ok = False
+            while time.time() < deadline and not self._stop_flag:
+                line = ser_slider.readline().decode("utf-8", errors="ignore").strip()
+                if line == "PARAM_OK":
+                    param_ok = True
+                    break
+            if not param_ok:
+                self.status_msg.emit("[警告] 未收到参数确认，继续...")
 
-    # 丢弃第一个有效行
-    while True:
-        raw = ser_det.readline().decode("utf-8", errors="ignore").strip()
-        if raw:
-            break
-
-    # 读取第二个有效整数
-    while True:
-        raw = ser_det.readline().decode("utf-8", errors="ignore").strip()
-        if not raw:
-            continue
-        try:
-            return int(raw)
-        except ValueError:
-            continue  # 非数字行跳过
-
-
-# ──────────────────────────────────────────────
-# 参数配置
-# ──────────────────────────────────────────────
-
-def configure():
-    print("=" * 52)
-    print("    光子计数扫描系统  上位机")
-    print("=" * 52)
-
-    print("\n--- 步骤 1/2：选择串口 ---")
-    port_slider   = select_port("滑台 Arduino")
-    port_detector = select_port("探测器")
-
-    output_file = get_str("\n输出文件名", OUTPUT_FILE)
-    start_mm    = get_float("起始位置 (mm)", 0.0)
-    end_mm      = get_float("终止位置 (mm)", 50.0)
-    step_mm     = get_float("步长 (mm)", 1.0)
-    cycles      = get_int("往复次数", 1)
-
-    if start_mm >= end_mm:
-        print("错误：起始位置必须小于终止位置")
-        sys.exit(1)
-    if step_mm <= 0:
-        print("错误：步长必须大于 0")
-        sys.exit(1)
-
-    steps = int((end_mm - start_mm) / step_mm) + 1
-    total_points = steps * 2 * cycles  # 每次往复 = 去 + 回
-
-    print()
-    print("--- 步骤 2/2：参数确认 ---")
-    print(f"  串口（滑台）  : {port_slider}")
-    print(f"  串口（探测器）: {port_detector}")
-    print(f"  起始位置      : {start_mm} mm")
-    print(f"  终止位置      : {end_mm} mm")
-    print(f"  步长          : {step_mm} mm")
-    print(f"  往复次数      : {cycles}")
-    print(f"  预计采集点数  : ~{total_points} 点")
-    print(f"  输出文件      : {output_file}")
-    print()
-
-    confirm = input("确认开始扫描？(y/n) [y]: ").strip().lower()
-    if confirm not in ("", "y", "yes"):
-        print("已取消")
-        sys.exit(0)
-
-    return port_slider, port_detector, output_file, start_mm, end_mm, step_mm, cycles
-
-
-# ──────────────────────────────────────────────
-# 主扫描流程
-# ──────────────────────────────────────────────
-
-def send_params(ser_slider, start_mm, end_mm, step_mm, cycles):
-    """
-    向 Arduino 发送扫描参数，格式：
-      P:<start>,<end>,<step>,<cycles>\n
-    等待 Arduino 回复 "PARAM_OK" 确认收到。
-    """
-    cmd = f"P:{start_mm:.3f},{end_mm:.3f},{step_mm:.3f},{cycles}\n"
-    ser_slider.write(cmd.encode("utf-8"))
-    print(f"  已发送参数: {cmd.strip()}")
-
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        line = ser_slider.readline().decode("utf-8", errors="ignore").strip()
-        if line == "PARAM_OK":
-            print("  Arduino 参数确认成功")
-            return
-    print("  [警告] 未收到 Arduino 参数确认，继续尝试...")
-
-
-def run_experiment(port_slider, port_detector, output_file,
-                   start_mm, end_mm, step_mm, cycles):
-    ser_slider = None
-    ser_det = None
-    try:
-        print("\n正在连接串口...")
-        ser_slider = serial.Serial(port_slider, BAUD_RATE, timeout=5)
-        ser_det    = serial.Serial(port_detector, BAUD_RATE, timeout=5)
-
-        # 等待 Arduino 完成复位（DTR 拉低会触发复位）
-        print("等待 Arduino 复位...", end="", flush=True)
-        time.sleep(2)
-        ser_slider.reset_input_buffer()
-        print(" 就绪")
-
-        print(f"数据将保存至 {output_file}")
-        print("按 Ctrl+C 可随时终止\n")
-
-        with open(output_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Cycle", "Position_mm", "Photon_Count"])
-
-            # 1. 先发参数
-            send_params(ser_slider, start_mm, end_mm, step_mm, cycles)
-
-            # 2. 发开始指令
+            # 发送开始指令
             ser_slider.write(b"S\n")
-            print("已发送开始指令，等待滑台响应...\n")
+            self.status_msg.emit("扫描进行中...")
 
-            while True:
+            while not self._stop_flag:
                 line = ser_slider.readline().decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
 
                 if "SCAN_FINISHED" in line:
-                    print("\n扫描任务完成！")
+                    self.status_msg.emit("扫描完成！")
                     break
 
                 if line.startswith("X:"):
-                    # 格式: X:10.500,N:1
                     try:
                         parts   = line.split(",")
                         pos_mm  = float(parts[0].split(":")[1])
                         cycle_n = int(parts[1].split(":")[1])
                     except (IndexError, ValueError):
-                        print(f"  [警告] 无法解析位置行: {line}")
                         ser_slider.write(b"G\n")
                         continue
 
-                    print(f"[第{cycle_n:2d}次] {pos_mm:7.3f} mm — 读取光子数...",
-                          end="", flush=True)
+                    self.status_msg.emit(
+                        f"[第 {cycle_n} 次]  {pos_mm:.3f} mm — 读取光子数...")
 
-                    photon = read_photon(ser_det)
-                    print(f" {photon}")
+                    photon = self._read_photon(ser_det)
+                    if photon is None:
+                        break
 
-                    writer.writerow([cycle_n, f"{pos_mm:.3f}", photon])
-                    f.flush()
-
-                    # 通知 Arduino 继续移动
+                    self.data_point.emit(cycle_n, pos_mm, photon)
                     ser_slider.write(b"G\n")
 
-    except serial.SerialException as e:
-        print(f"\n串口错误: {e}")
-    except KeyboardInterrupt:
-        print("\n用户手动停止扫描")
-    finally:
-        if ser_slider is not None:
-            ser_slider.close()
-        if ser_det is not None:
-            ser_det.close()
-        print("串口已关闭，程序退出")
+        except serial.SerialException as e:
+            self.error_msg.emit(f"串口错误: {e}")
+        finally:
+            if ser_slider:
+                ser_slider.close()
+            if ser_det:
+                ser_det.close()
+            self.finished.emit()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# Matplotlib 画布
+# ══════════════════════════════════════════════
+
+class ScanCanvas(FigureCanvas):
+    def __init__(self):
+        self.fig = Figure(tight_layout=True)
+        self.ax  = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self._data: dict[int, tuple[list, list]] = {}   # {cycle: ([x], [y])}
+        self._log_scale = False
+        self._setup_axes()
+
+    def _setup_axes(self):
+        self.ax.set_xlabel("位置 (mm)", fontsize=11)
+        self.ax.set_ylabel("光子数", fontsize=11)
+        self.ax.set_title("实时扫描数据", fontsize=12)
+        self.ax.grid(True, which="both", linestyle="--", alpha=0.5)
+
+    def clear_data(self):
+        self._data.clear()
+        self.ax.cla()
+        self._setup_axes()
+        self.draw()
+
+    def add_point(self, cycle: int, pos_mm: float, photon: int):
+        if cycle not in self._data:
+            self._data[cycle] = ([], [])
+        self._data[cycle][0].append(pos_mm)
+        self._data[cycle][1].append(photon)
+        self._redraw()
+
+    def set_log_scale(self, enabled: bool):
+        self._log_scale = enabled
+        self._redraw()
+
+    def _redraw(self):
+        self.ax.cla()
+        self._setup_axes()
+
+        try:
+            cmap = matplotlib.colormaps["tab10"]
+        except AttributeError:
+            cmap = matplotlib.cm.get_cmap("tab10")   # matplotlib < 3.7 兼容
+
+        for cycle, (xs, ys) in sorted(self._data.items()):
+            color = cmap(((cycle - 1) % 10) / 10)
+            self.ax.scatter(xs, ys, s=20, color=color,
+                            label=f"第 {cycle} 次", zorder=3)
+
+        # 对数坐标：用 symlog 避免 0 值报错
+        if self._log_scale:
+            self.ax.set_yscale("symlog", linthresh=1)
+            self.ax.set_ylabel("光子数 (对数)", fontsize=11)
+        else:
+            self.ax.set_yscale("linear")
+            self.ax.set_ylabel("光子数", fontsize=11)
+
+        if len(self._data) > 1:
+            self.ax.legend(fontsize=9, loc="best")
+
+        self.ax.grid(True, which="both", linestyle="--", alpha=0.5)
+        self.draw()
+
+
+# ══════════════════════════════════════════════
+# 主窗口
+# ══════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("光子计数扫描系统")
+        self.resize(1150, 680)
+        self.worker     = None
+        self.csv_file   = None
+        self.csv_writer = None
+        self._build_ui()
+
+    # ── 界面构建 ────────────────────────────────
+
+    def _build_ui(self):
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._panel_left())
+        splitter.addWidget(self._panel_right())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([295, 855])
+        self.setCentralWidget(splitter)
+
+        self.statusbar = QStatusBar()
+        self.setStatusBar(self.statusbar)
+        self.statusbar.showMessage("就绪")
+
+    def _panel_left(self):
+        panel = QWidget()
+        panel.setFixedWidth(300)
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        layout.addWidget(self._group_ports())
+        layout.addWidget(self._group_params())
+        layout.addWidget(self._group_output())
+        layout.addStretch()
+        layout.addWidget(self._btn_start())
+        return panel
+
+    def _group_ports(self):
+        group  = QGroupBox("串口配置")
+        layout = QFormLayout(group)
+        layout.setSpacing(6)
+
+        self.combo_slider = QComboBox()
+        btn_s = QPushButton("扫描"); btn_s.setFixedWidth(48)
+        btn_s.clicked.connect(lambda: self._refresh_ports(self.combo_slider))
+        row_s = QHBoxLayout()
+        row_s.addWidget(self.combo_slider); row_s.addWidget(btn_s)
+        layout.addRow("滑台:", row_s)
+
+        self.combo_det = QComboBox()
+        btn_d = QPushButton("扫描"); btn_d.setFixedWidth(48)
+        btn_d.clicked.connect(lambda: self._refresh_ports(self.combo_det))
+        row_d = QHBoxLayout()
+        row_d.addWidget(self.combo_det); row_d.addWidget(btn_d)
+        layout.addRow("探测器:", row_d)
+
+        # 启动时自动扫描一次
+        self._refresh_ports(self.combo_slider)
+        self._refresh_ports(self.combo_det)
+        return group
+
+    def _group_params(self):
+        group  = QGroupBox("扫描参数")
+        layout = QFormLayout(group)
+        layout.setSpacing(6)
+
+        self.edit_start  = QLineEdit("0.0")
+        self.edit_end    = QLineEdit("50.0")
+        self.edit_step   = QLineEdit("1.0")
+        self.edit_cycles = QLineEdit("1")
+
+        layout.addRow("起始 (mm):", self.edit_start)
+        layout.addRow("终止 (mm):", self.edit_end)
+        layout.addRow("步长 (mm):", self.edit_step)
+        layout.addRow("往复次数:",  self.edit_cycles)
+        return group
+
+    def _group_output(self):
+        group  = QGroupBox("输出 & 显示")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+
+        row = QHBoxLayout()
+        self.edit_file = QLineEdit(OUTPUT_FILE)
+        btn_browse = QPushButton("…"); btn_browse.setFixedWidth(30)
+        btn_browse.clicked.connect(self._browse_file)
+        row.addWidget(self.edit_file); row.addWidget(btn_browse)
+        layout.addLayout(row)
+
+        self.chk_log = QCheckBox("Y 轴对数坐标")
+        self.chk_log.toggled.connect(self.canvas_widget_ref_placeholder)   # 延迟绑定
+        layout.addWidget(self.chk_log)
+        return group
+
+    def _btn_start(self):
+        self.btn_start = QPushButton("开始扫描")
+        self.btn_start.setFixedHeight(46)
+        f = self.btn_start.font(); f.setPointSize(12); f.setBold(True)
+        self.btn_start.setFont(f)
+        self.btn_start.clicked.connect(self._on_start_stop)
+        return self.btn_start
+
+    def _panel_right(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        self.canvas  = ScanCanvas()
+        self.toolbar = NavigationToolbar(self.canvas, widget)
+
+        # 现在 canvas 已创建，绑定对数切换信号
+        self.chk_log.toggled.connect(self.canvas.set_log_scale)
+
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        return widget
+
+    # ── 串口扫描 ────────────────────────────────
+
+    def _refresh_ports(self, combo: QComboBox):
+        ports   = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
+        current = combo.currentData()
+        combo.clear()
+        for p in ports:
+            combo.addItem(f"{p.device}  —  {p.description}", userData=p.device)
+        idx = combo.findData(current)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    # ── 事件处理 ────────────────────────────────
+
+    def _browse_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存数据文件", self.edit_file.text(), "CSV (*.csv)")
+        if path:
+            self.edit_file.setText(path)
+
+    def _on_start_stop(self):
+        if self.worker and self.worker.isRunning():
+            self._stop_scan()
+        else:
+            self._start_scan()
+
+    def _start_scan(self):
+        # 参数校验
+        try:
+            start_mm = float(self.edit_start.text())
+            end_mm   = float(self.edit_end.text())
+            step_mm  = float(self.edit_step.text())
+            cycles   = int(self.edit_cycles.text())
+        except ValueError:
+            QMessageBox.warning(self, "输入错误", "请检查扫描参数格式")
+            return
+        if start_mm >= end_mm:
+            QMessageBox.warning(self, "输入错误", "起始位置必须小于终止位置")
+            return
+        if step_mm <= 0:
+            QMessageBox.warning(self, "输入错误", "步长必须大于 0")
+            return
+
+        port_slider = self.combo_slider.currentData()
+        port_det    = self.combo_det.currentData()
+        if not port_slider or not port_det:
+            QMessageBox.warning(self, "串口错误", "请先扫描并选择串口")
+            return
+
+        out_file = self.edit_file.text().strip() or OUTPUT_FILE
+        try:
+            self.csv_file   = open(out_file, "w", newline="", encoding="utf-8")
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(["Cycle", "Position_mm", "Photon_Count"])
+        except OSError as e:
+            QMessageBox.critical(self, "文件错误", str(e))
+            return
+
+        self.canvas.clear_data()
+        self.btn_start.setText("停止扫描")
+
+        self.worker = ScanWorker(
+            port_slider, port_det, start_mm, end_mm, step_mm, cycles)
+        self.worker.data_point.connect(self._on_data_point)
+        self.worker.status_msg.connect(self.statusbar.showMessage)
+        self.worker.error_msg.connect(
+            lambda msg: QMessageBox.critical(self, "错误", msg))
+        self.worker.finished.connect(self._on_scan_finished)
+        self.worker.start()
+
+    def _stop_scan(self):
+        if self.worker:
+            self.worker.stop()
+        self.statusbar.showMessage("正在停止...")
+
+    def _on_data_point(self, cycle: int, pos_mm: float, photon: int):
+        self.canvas.add_point(cycle, pos_mm, photon)
+        if self.csv_writer:
+            self.csv_writer.writerow([cycle, f"{pos_mm:.3f}", photon])
+            self.csv_file.flush()
+
+    def _on_scan_finished(self):
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file   = None
+            self.csv_writer = None
+        self.btn_start.setText("开始扫描")
+        self.worker = None
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(3000)
+        if self.csv_file:
+            self.csv_file.close()
+        event.accept()
+
+    # 占位，_panel_right 之前 canvas 尚未创建时使用
+    def canvas_widget_ref_placeholder(self, _):
+        pass
+
+
+# ══════════════════════════════════════════════
 
 if __name__ == "__main__":
-    params = configure()
-    run_experiment(*params)
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
