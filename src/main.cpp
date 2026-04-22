@@ -95,8 +95,8 @@ void startScan() {
 
 void setup() {
     Serial.begin(115200);
-    slider.setMaxSpeed(2000.0);
-    slider.setAcceleration(1000.0);
+    slider.setMaxSpeed(4000.0);
+    slider.setAcceleration(3000.0);
     slider.setCurrentPosition(0);
 }
 

@@ -1,6 +1,7 @@
 import serial
 import serial.tools.list_ports
 import csv
+import time
 import sys
 
 # --- 默认配置 ---
