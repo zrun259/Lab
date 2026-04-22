@@ -1,6 +1,5 @@
 import serial
 import serial.tools.list_ports
-import time
 import csv
 import sys
 
@@ -199,7 +198,7 @@ def run_experiment(port_slider, port_detector, output_file,
 
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Cycle", "Position_mm", "Photon_Count"])
+            writer.writerow(["Cycle", "Position_mm", "Photon_Count"])
 
             # 1. 先发参数
             send_params(ser_slider, start_mm, end_mm, step_mm, cycles)
@@ -234,8 +233,7 @@ def run_experiment(port_slider, port_detector, output_file,
                     photon = read_photon(ser_det)
                     print(f" {photon}")
 
-                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                    writer.writerow([timestamp, cycle_n, f"{pos_mm:.3f}", photon])
+                    writer.writerow([cycle_n, f"{pos_mm:.3f}", photon])
                     f.flush()
 
                     # 通知 Arduino 继续移动
