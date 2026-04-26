@@ -62,6 +62,17 @@ bool parseParams(const String& line) {
 }
 
 // ──────────────────────────────────────────────
+// 点动指令  J:<steps>  （相对移动，可为负数）
+// ──────────────────────────────────────────────
+void doJog(long steps) {
+    slider.move(steps);
+    while (slider.distanceToGo() != 0) {
+        slider.run();
+    }
+    Serial.println("JOG_OK");
+}
+
+// ──────────────────────────────────────────────
 // 执行扫描
 // ──────────────────────────────────────────────
 void startScan() {
@@ -106,6 +117,9 @@ void loop() {
             } else {
                 Serial.println("PARAM_ERR");
             }
+        } else if (cmd.startsWith("J:")) {
+            long steps = cmd.substring(2).toInt();
+            doJog(steps);
         } else if (cmd == "S" || cmd == "s") {
             startScan();
         } else if (cmd == "Z" || cmd == "z") {

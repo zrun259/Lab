@@ -40,6 +40,41 @@ OUTPUT_FILE = "scan_data.csv"
 
 
 # ══════════════════════════════════════════════
+# 点动工作线程
+# ══════════════════════════════════════════════
+
+
+class JogWorker(QThread):
+    status_msg = pyqtSignal(str)
+    error_msg = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, ser: serial.Serial, command: str, expect: str):
+        super().__init__()
+        self.ser = ser
+        self.command = command  # 已编码的字节字符串（str，run 内编码）
+        self.expect = expect    # 期待的响应关键字
+
+    def run(self):
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(self.command.encode("utf-8"))
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                if self.expect in line:
+                    self.status_msg.emit(f"完成: {line}")
+                    return
+            self.error_msg.emit("等待 Arduino 响应超时")
+        except serial.SerialException as e:
+            self.error_msg.emit(f"串口错误: {e}")
+        finally:
+            self.finished.emit()
+
+
+# ══════════════════════════════════════════════
 # 扫描工作线程
 # ══════════════════════════════════════════════
 
@@ -232,6 +267,8 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.csv_file = None
         self.csv_writer = None
+        self._jog_ser: serial.Serial | None = None
+        self._jog_worker: JogWorker | None = None
         self._build_ui()
 
     # ── 界面构建 ────────────────────────────────
@@ -257,6 +294,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
 
         layout.addWidget(self._group_ports())
+        layout.addWidget(self._group_calibration())
         layout.addWidget(self._group_params())
         layout.addWidget(self._group_output())
         layout.addStretch()
@@ -289,6 +327,44 @@ class MainWindow(QMainWindow):
         # 启动时自动扫描一次
         self._refresh_ports(self.combo_slider)
         self._refresh_ports(self.combo_det)
+        return group
+
+    def _group_calibration(self):
+        group = QGroupBox("校准零点")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+
+        # 连接/断开按钮
+        self.btn_jog_connect = QPushButton("连接滑台")
+        self.btn_jog_connect.setCheckable(True)
+        self.btn_jog_connect.clicked.connect(self._on_jog_connect)
+        layout.addWidget(self.btn_jog_connect)
+
+        # 步数输入
+        row_steps = QHBoxLayout()
+        row_steps.addWidget(QLabel("步数:"))
+        self.edit_jog_steps = QLineEdit("1600")
+        self.edit_jog_steps.setFixedWidth(80)
+        row_steps.addWidget(self.edit_jog_steps)
+        row_steps.addStretch()
+        layout.addLayout(row_steps)
+
+        # 前进 / 后退
+        row_move = QHBoxLayout()
+        self.btn_backward = QPushButton("← 后退")
+        self.btn_forward = QPushButton("前进 →")
+        self.btn_backward.clicked.connect(lambda: self._do_jog(forward=False))
+        self.btn_forward.clicked.connect(lambda: self._do_jog(forward=True))
+        row_move.addWidget(self.btn_backward)
+        row_move.addWidget(self.btn_forward)
+        layout.addLayout(row_move)
+
+        # 设为零点
+        self.btn_set_zero = QPushButton("设为零点")
+        self.btn_set_zero.clicked.connect(self._do_set_zero)
+        layout.addWidget(self.btn_set_zero)
+
+        self._set_jog_controls_enabled(False)
         return group
 
     def _group_params(self):
@@ -363,6 +439,84 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             combo.setCurrentIndex(idx)
 
+    # ── 校准零点 ────────────────────────────────
+
+    def _set_jog_controls_enabled(self, enabled: bool):
+        self.btn_backward.setEnabled(enabled)
+        self.btn_forward.setEnabled(enabled)
+        self.btn_set_zero.setEnabled(enabled)
+        self.edit_jog_steps.setEnabled(enabled)
+
+    def _on_jog_connect(self, checked: bool):
+        if checked:
+            port = self.combo_slider.currentData()
+            if not port:
+                QMessageBox.warning(self, "串口错误", "请先选择滑台串口")
+                self.btn_jog_connect.setChecked(False)
+                return
+            try:
+                self._jog_ser = serial.Serial(port, BAUD_RATE, timeout=5)
+                self.btn_jog_connect.setText("断开滑台")
+                self.statusbar.showMessage("等待 Arduino 复位 (2s)...")
+                # 在后台等待，不阻塞 UI
+                QThread.msleep(2000)
+                self._jog_ser.reset_input_buffer()
+                self._set_jog_controls_enabled(True)
+                self.statusbar.showMessage("滑台已连接，可开始校准")
+            except serial.SerialException as e:
+                self._jog_ser = None
+                self.btn_jog_connect.setChecked(False)
+                QMessageBox.critical(self, "连接失败", str(e))
+        else:
+            self._disconnect_jog()
+
+    def _disconnect_jog(self):
+        if self._jog_ser and self._jog_ser.is_open:
+            self._jog_ser.close()
+        self._jog_ser = None
+        self.btn_jog_connect.setChecked(False)
+        self.btn_jog_connect.setText("连接滑台")
+        self._set_jog_controls_enabled(False)
+        self.statusbar.showMessage("滑台已断开")
+
+    def _run_jog_command(self, command: str, expect: str):
+        if not self._jog_ser or not self._jog_ser.is_open:
+            return
+        if self._jog_worker and self._jog_worker.isRunning():
+            return  # 上一条指令还在执行
+
+        self._set_jog_controls_enabled(False)
+        self.btn_jog_connect.setEnabled(False)
+
+        self._jog_worker = JogWorker(self._jog_ser, command, expect)
+        self._jog_worker.status_msg.connect(self.statusbar.showMessage)
+        self._jog_worker.error_msg.connect(
+            lambda msg: QMessageBox.critical(self, "错误", msg)
+        )
+        self._jog_worker.finished.connect(self._on_jog_finished)
+        self._jog_worker.start()
+
+    def _on_jog_finished(self):
+        self._set_jog_controls_enabled(True)
+        self.btn_jog_connect.setEnabled(True)
+
+    def _do_jog(self, forward: bool):
+        try:
+            steps = int(self.edit_jog_steps.text())
+        except ValueError:
+            QMessageBox.warning(self, "输入错误", "步数必须为整数")
+            return
+        if steps <= 0:
+            QMessageBox.warning(self, "输入错误", "步数必须大于 0")
+            return
+        delta = steps if forward else -steps
+        self._run_jog_command(f"J:{delta}\n", "JOG_OK")
+        self.statusbar.showMessage(f"点动 {'前进' if forward else '后退'} {steps} 步...")
+
+    def _do_set_zero(self):
+        self._run_jog_command("Z\n", "ZERO_OK")
+        self.statusbar.showMessage("正在设置零点...")
+
     # ── 事件处理 ────────────────────────────────
 
     def _browse_file(self):
@@ -400,6 +554,10 @@ class MainWindow(QMainWindow):
         if not port_slider or not port_det:
             QMessageBox.warning(self, "串口错误", "请先扫描并选择串口")
             return
+
+        # 校准连接占用同一串口，扫描前自动断开
+        if self._jog_ser and self._jog_ser.is_open:
+            self._disconnect_jog()
 
         out_file = self.edit_file.text().strip() or OUTPUT_FILE
         try:
@@ -447,6 +605,8 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
+        if self._jog_ser and self._jog_ser.is_open:
+            self._jog_ser.close()
         if self.csv_file:
             self.csv_file.close()
         event.accept()
