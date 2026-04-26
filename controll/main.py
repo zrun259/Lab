@@ -45,18 +45,18 @@ OUTPUT_FILE = "scan_data.csv"
 
 
 class ScanWorker(QThread):
-    data_point = pyqtSignal(int, float, int)  # cycle, pos_mm, photon
+    data_point = pyqtSignal(int, int, int)  # cycle, pos_steps, photon
     status_msg = pyqtSignal(str)
     error_msg = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, port_slider, port_detector, start_mm, end_mm, step_mm, cycles):
+    def __init__(self, port_slider, port_detector, start_steps, end_steps, step_steps, cycles):
         super().__init__()
         self.port_slider = port_slider
         self.port_detector = port_detector
-        self.start_mm = start_mm
-        self.end_mm = end_mm
-        self.step_mm = step_mm
+        self.start_steps = start_steps
+        self.end_steps = end_steps
+        self.step_steps = step_steps
         self.cycles = cycles
         self._stop_flag = False
 
@@ -95,8 +95,8 @@ class ScanWorker(QThread):
 
             # 发送扫描参数
             cmd = (
-                f"P:{self.start_mm:.3f},{self.end_mm:.3f},"
-                f"{self.step_mm:.3f},{self.cycles}\n"
+                f"P:{self.start_steps},{self.end_steps},"
+                f"{self.step_steps},{self.cycles}\n"
             )
             ser_slider.write(cmd.encode("utf-8"))
             self.status_msg.emit(f"已发送参数: {cmd.strip()}")
@@ -127,21 +127,21 @@ class ScanWorker(QThread):
                 if line.startswith("X:"):
                     try:
                         parts = line.split(",")
-                        pos_mm = float(parts[0].split(":")[1])
+                        pos_steps = int(parts[0].split(":")[1])
                         cycle_n = int(parts[1].split(":")[1])
                     except (IndexError, ValueError):
                         ser_slider.write(b"G\n")
                         continue
 
                     self.status_msg.emit(
-                        f"[第 {cycle_n} 次]  {pos_mm:.3f} mm — 读取光子数..."
+                        f"[第 {cycle_n} 次]  {pos_steps} 步 — 读取光子数..."
                     )
 
                     photon = self._read_photon(ser_det)
                     if photon is None:
                         break
 
-                    self.data_point.emit(cycle_n, pos_mm, photon)
+                    self.data_point.emit(cycle_n, pos_steps, photon)
                     ser_slider.write(b"G\n")
 
         except serial.SerialException as e:
@@ -169,7 +169,7 @@ class ScanCanvas(FigureCanvas):
         self._setup_axes()
 
     def _setup_axes(self):
-        self.ax.set_xlabel("位置 (mm)", fontsize=11)
+        self.ax.set_xlabel("位置 (步)", fontsize=11)
         self.ax.set_ylabel("光子数", fontsize=11)
         self.ax.set_title("实时扫描数据", fontsize=12)
         self.ax.grid(True, which="both", linestyle="--", alpha=0.5)
@@ -180,10 +180,10 @@ class ScanCanvas(FigureCanvas):
         self._setup_axes()
         self.draw()
 
-    def add_point(self, cycle: int, pos_mm: float, photon: int):
+    def add_point(self, cycle: int, pos_steps: int, photon: int):
         if cycle not in self._data:
             self._data[cycle] = ([], [])
-        self._data[cycle][0].append(pos_mm)
+        self._data[cycle][0].append(pos_steps)
         self._data[cycle][1].append(photon)
         self._redraw()
 
@@ -296,14 +296,14 @@ class MainWindow(QMainWindow):
         layout = QFormLayout(group)
         layout.setSpacing(6)
 
-        self.edit_start = QLineEdit("0.0")
-        self.edit_end = QLineEdit("50.0")
-        self.edit_step = QLineEdit("1.0")
+        self.edit_start = QLineEdit("0")
+        self.edit_end = QLineEdit("80000")
+        self.edit_step = QLineEdit("1600")
         self.edit_cycles = QLineEdit("1")
 
-        layout.addRow("起始 (mm):", self.edit_start)
-        layout.addRow("终止 (mm):", self.edit_end)
-        layout.addRow("步长 (mm):", self.edit_step)
+        layout.addRow("起始 (步):", self.edit_start)
+        layout.addRow("终止 (步):", self.edit_end)
+        layout.addRow("步长 (步):", self.edit_step)
         layout.addRow("往复次数:", self.edit_cycles)
         return group
 
@@ -381,17 +381,17 @@ class MainWindow(QMainWindow):
     def _start_scan(self):
         # 参数校验
         try:
-            start_mm = float(self.edit_start.text())
-            end_mm = float(self.edit_end.text())
-            step_mm = float(self.edit_step.text())
+            start_steps = int(self.edit_start.text())
+            end_steps = int(self.edit_end.text())
+            step_steps = int(self.edit_step.text())
             cycles = int(self.edit_cycles.text())
         except ValueError:
             QMessageBox.warning(self, "输入错误", "请检查扫描参数格式")
             return
-        if start_mm >= end_mm:
+        if start_steps >= end_steps:
             QMessageBox.warning(self, "输入错误", "起始位置必须小于终止位置")
             return
-        if step_mm <= 0:
+        if step_steps <= 0:
             QMessageBox.warning(self, "输入错误", "步长必须大于 0")
             return
 
@@ -405,7 +405,7 @@ class MainWindow(QMainWindow):
         try:
             self.csv_file = open(out_file, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(["Cycle", "Position_mm", "Photon_Count"])
+            self.csv_writer.writerow(["Cycle", "Position_steps", "Photon_Count"])
         except OSError as e:
             QMessageBox.critical(self, "文件错误", str(e))
             return
@@ -414,7 +414,7 @@ class MainWindow(QMainWindow):
         self.btn_start.setText("停止扫描")
 
         self.worker = ScanWorker(
-            port_slider, port_det, start_mm, end_mm, step_mm, cycles
+            port_slider, port_det, start_steps, end_steps, step_steps, cycles
         )
         self.worker.data_point.connect(self._on_data_point)
         self.worker.status_msg.connect(self.statusbar.showMessage)
@@ -429,10 +429,10 @@ class MainWindow(QMainWindow):
             self.worker.stop()
         self.statusbar.showMessage("正在停止...")
 
-    def _on_data_point(self, cycle: int, pos_mm: float, photon: int):
-        self.canvas.add_point(cycle, pos_mm, photon)
+    def _on_data_point(self, cycle: int, pos_steps: int, photon: int):
+        self.canvas.add_point(cycle, pos_steps, photon)
         if self.csv_writer:
-            self.csv_writer.writerow([cycle, f"{pos_mm:.3f}", photon])
+            self.csv_writer.writerow([cycle, pos_steps, photon])
             self.csv_file.flush()
 
     def _on_scan_finished(self):
